@@ -1,0 +1,245 @@
+version: '3.8'
+
+services:
+  # ========== PostgreSQL Source (интернет-магазин) ==========
+  postgres-source:
+    image: postgres:15-alpine
+    container_name: postgres-source
+    environment:
+      POSTGRES_DB: ${POSTGRES_SOURCE_DB:-source_db}
+      POSTGRES_USER: ${POSTGRES_SOURCE_USER:-source_user}
+      POSTGRES_PASSWORD: ${POSTGRES_SOURCE_PASSWORD:-source_password123}
+    ports:
+      - "${POSTGRES_SOURCE_PORT:-5433}:5432"
+    volumes:
+      - postgres_source_data:/var/lib/postgresql/data
+      - ./init/init_source_db.sql:/docker-entrypoint-initdb.d/init_source_db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SOURCE_USER:-source_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - etl-network
+
+  # ========== PostgreSQL Analytics ==========
+  postgres-analytics:
+    image: postgres:15-alpine
+    container_name: postgres-analytics
+    environment:
+      POSTGRES_DB: ${POSTGRES_ANALYTICS_DB:-analytics_db}
+      POSTGRES_USER: ${POSTGRES_ANALYTICS_USER:-analytics_user}
+      POSTGRES_PASSWORD: ${POSTGRES_ANALYTICS_PASSWORD:-analytics_password123}
+    ports:
+      - "${POSTGRES_ANALYTICS_PORT:-5434}:5432"
+    volumes:
+      - postgres_analytics_data:/var/lib/postgresql/data
+      - ./init/init_analytics_db.sql:/docker-entrypoint-initdb.d/init_analytics_db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_ANALYTICS_USER:-analytics_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - etl-network
+
+  # ========== PostgreSQL DWH ==========
+  postgres-dwh:
+    image: postgres:15-alpine
+    container_name: postgres-dwh
+    environment:
+      POSTGRES_DB: ${POSTGRES_DWH_DB:-dwh_db}
+      POSTGRES_USER: ${POSTGRES_DWH_USER:-dwh_user}
+      POSTGRES_PASSWORD: ${POSTGRES_DWH_PASSWORD:-dwh_password123}
+    ports:
+      - "${POSTGRES_DWH_PORT:-5435}:5432"
+    volumes:
+      - postgres_dwh_data:/var/lib/postgresql/data
+      - ./init/init_dwh.sql:/docker-entrypoint-initdb.d/init_dwh.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_DWH_USER:-dwh_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - etl-network
+
+  # ========== MongoDB (Для отзывов и документов) ==========
+  mongodb:
+    image: mongo:6-jammy
+    container_name: mongodb
+    environment:
+      MONGO_INITDB_DATABASE: ${MONGO_DB:-source_mongo_db}
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-mongo_user}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-mongo_password123}
+    ports:
+      - "${MONGO_PORT:-27017}:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./init/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js
+    command: mongod --auth
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/${MONGO_DB:-source_mongo_db} --quiet
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - etl-network
+
+  # ========== Mongo Express (Веб-интерфейс для MongoDB) ==========
+  mongo-express:
+    image: mongo-express:latest
+    container_name: mongo-express
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: ${MONGO_USER:-mongo_user}
+      ME_CONFIG_MONGODB_ADMINPASSWORD: ${MONGO_PASSWORD:-mongo_password123}
+      ME_CONFIG_MONGODB_URL: mongodb://${MONGO_USER:-mongo_user}:${MONGO_PASSWORD:-mongo_password123}@mongodb:27017/
+      ME_CONFIG_BASICAUTH: false
+    ports:
+      - "5051:8081"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - etl-network
+
+  # ========== PgAdmin (Веб-интерфейс для PostgreSQL) ==========
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin}
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - postgres-source
+      - postgres-analytics
+      - postgres-dwh
+    networks:
+      - etl-network
+
+  # ========== Airflow Webserver ==========
+  postgres-airflow:
+    image: postgres:15-alpine
+    container_name: postgres-airflow
+    environment:
+      POSTGRES_DB: airflow_db
+      POSTGRES_USER: airflow_user
+      POSTGRES_PASSWORD: airflow_password
+    ports:
+      - "5436:5432"
+    volumes:
+      - postgres_airflow_data:/var/lib/postgresql/data
+    networks:
+      - etl-network
+
+  airflow-init:
+    image: apache/airflow:2.10.0-python3.10
+    container_name: airflow-init
+    depends_on:
+      - postgres-airflow
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow_user:airflow_password@postgres-airflow:5432/airflow_db
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    volumes:
+      - ./scripts:/opt/airflow/scripts
+    command: >
+      bash -c "
+        echo 'Ожидание БД...' &&
+        until pg_isready -h postgres-airflow -p 5432; do sleep 2; done &&
+        echo 'Инициализация Airflow...' &&
+        airflow db migrate &&
+        echo 'Создание пользователя...' &&
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com \
+          --password admin &&
+        echo 'Инициализация завершена'
+      "
+    networks:
+      - etl-network
+
+  airflow-webserver:
+    image: apache/airflow:2.10.0-python3.10
+    container_name: airflow-webserver
+    depends_on:
+      - postgres-airflow
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow_user:airflow_password@postgres-airflow:5432/airflow_db
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-VMAkK_Y7xqfnWLYVSMNQN40a9Bhb4Spn0R1lK5-Tn1s=}
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__CORE__LOAD_DEFAULT_CONNECTIONS: 'false'
+      AIRFLOW__CORE__ENABLE_XCOM_PICKLING: 'true'
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./scripts:/opt/airflow/scripts
+      - ./data:/opt/airflow/data
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ./data/csv:/opt/airflow/data/csv:ro 
+    ports:
+      - "8080:8080"
+    command: >
+      bash -c "
+        echo 'Ожидание БД Airflow...' &&
+        until pg_isready -h postgres-airflow -p 5432; do sleep 2; done &&
+        echo 'Настройка подключений Airflow...' &&
+        python /opt/airflow/scripts/setup_connections.py &&
+        echo 'Запуск webserver...' &&
+        airflow webserver
+      "
+    networks:
+      - etl-network
+
+  airflow-scheduler:
+    image: apache/airflow:2.10.0-python3.10
+    container_name: airflow-scheduler
+    depends_on:
+      - airflow-webserver
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow_user:airflow_password@postgres-airflow:5432/airflow_db
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-VMAkK_Y7xqfnWLYVSMNQN40a9Bhb4Spn0R1lK5-Tn1s=}
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__CORE__LOAD_DEFAULT_CONNECTIONS: 'false'
+      AIRFLOW__CORE__ENABLE_XCOM_PICKLING: 'true'
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./scripts:/opt/airflow/scripts
+      - ./data:/opt/airflow/data
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ./data/csv:/opt/airflow/data/csv:ro 
+    command: >
+      bash -c "
+        echo 'Ожидание webserver...' &&
+        until curl -s http://airflow-webserver:8080/health > /dev/null; do sleep 2; done &&
+        echo 'Настройка подключений...' &&
+        python /opt/airflow/scripts/setup_connections.py &&
+        echo 'Запуск scheduler...' &&
+        airflow scheduler
+      "
+    networks:
+      - etl-network
+
+volumes:
+  postgres_source_data:
+  postgres_analytics_data:
+  postgres_dwh_data:
+  postgres_airflow_data:
+  mongodb_data:
+  pgadmin_data:
+  airflow_logs:
+  plugins_volume:
+
+
+networks:
+  etl-network:
+    driver: bridge
